@@ -1,0 +1,41 @@
+{
+  "constraints": {
+    "top_k": 5,
+    "allow_friday": true,
+    "include_closed": true,
+    "show_reserved": true,
+    "earliest_start_time": "09:00",
+    "latest_end_time": "17:00"
+  },
+  "selections": {
+    "course": [
+      ["C C 302", "C C 303"],
+      ["C S 429"],
+      ["M - Upper"],
+      ["38265"]
+    ],
+    "taken_courses": [
+      "C S 314",
+      "C S 311",
+      "M 408D",
+      "HIS 315K",
+      "RHE 306",
+      "M 408C",
+      "ECO 304L",
+      "CH 302",
+      "CH 301",
+      "C S 312",
+      "BIO 311C",
+      "SDS 321",
+      "C C 303",
+      "GOV 312L",
+      "C C 302",
+      "C S 429",
+      "HIS 315L",
+      "M 340L"
+    ],
+    "excluded_instructors": [
+      "RUSIN"
+    ]
+  }
+}
