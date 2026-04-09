@@ -36,10 +36,11 @@ CONFIG_PATH = BASE_DIR / "config.json"
 DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 TIME_SLOT_MINUTES = 30
 DEFAULT_PRIORITY_ORDER = (
-    "fewer_gaps",
     "fewer_days",
-    "earlier_finish",
+    "avoid_long_spans",
     "compact_days",
+    "earlier_finish",
+    "fewer_gaps",
     "balanced_week",
 )
 
@@ -105,6 +106,7 @@ class ScheduleMetrics:
     earliest_start: float
     latest_end: float
     max_daily_span: float
+    long_span_penalty: float
     daily_hours_std: float
     average_end: float
 
@@ -757,6 +759,7 @@ def evaluate_schedule(selections: List[SectionSelection]) -> ScheduleMetrics:
     earliest_start: Optional[int] = None
     latest_end: Optional[int] = None
     max_daily_span = 0
+    long_span_penalty = 0
     daily_latest: List[int] = []
     daily_hours: List[float] = []
 
@@ -775,8 +778,11 @@ def evaluate_schedule(selections: List[SectionSelection]) -> ScheduleMetrics:
         intervals.sort(key=lambda item: item[0])
         day_start = intervals[0][0]
         day_end = intervals[-1][1]
+        day_span = day_end - day_start
         daily_latest.append(day_end)
-        max_daily_span = max(max_daily_span, day_end - day_start)
+        max_daily_span = max(max_daily_span, day_span)
+        if day_span > 4 * 60:
+            long_span_penalty += day_span - 4 * 60
         earliest_start = day_start if earliest_start is None else min(earliest_start, day_start)
         latest_end = day_end if latest_end is None else max(latest_end, day_end)
 
@@ -798,6 +804,7 @@ def evaluate_schedule(selections: List[SectionSelection]) -> ScheduleMetrics:
         earliest_start=float(earliest_start or 0.0),
         latest_end=float(latest_end or 0.0),
         max_daily_span=float(max_daily_span),
+        long_span_penalty=float(long_span_penalty),
         daily_hours_std=float(daily_hours_std),
         average_end=float(average_end),
     )
@@ -805,10 +812,11 @@ def evaluate_schedule(selections: List[SectionSelection]) -> ScheduleMetrics:
 
 def schedule_sort_key(metrics: ScheduleMetrics) -> Tuple[float, ...]:
     return (
-        metrics.total_gap,
         metrics.days_with_classes,
-        metrics.latest_end,
+        metrics.long_span_penalty,
         metrics.max_daily_span,
+        metrics.latest_end,
+        metrics.total_gap,
         metrics.daily_hours_std,
         metrics.average_end,
     )
@@ -874,10 +882,11 @@ def render_schedule(schedule: Schedule, index: int) -> None:
     print(f"Ranking priorities: {describe_priorities()}")
     print(
         "Schedule metrics: "
-        f"total_gap={metrics.total_gap:.1f} min, "
         f"days_with_classes={int(metrics.days_with_classes)}, "
-        f"latest_end={minutes_to_time_str(metrics.latest_end)}, "
+        f"long_span_penalty={metrics.long_span_penalty:.1f} min, "
         f"max_daily_span={format_duration(metrics.max_daily_span)}, "
+        f"latest_end={minutes_to_time_str(metrics.latest_end)}, "
+        f"total_gap={metrics.total_gap:.1f} min, "
         f"daily_hours_std={metrics.daily_hours_std:.2f} h, "
         f"earliest_start={minutes_to_time_str(metrics.earliest_start)}"
     )
