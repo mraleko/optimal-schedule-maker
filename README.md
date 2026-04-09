@@ -4,7 +4,7 @@ Generate the top course schedules from UT Austin HTML exports using a constraint
 
 1. Parses registrar HTML results and groups sections by field/level selection rules in `config.json`.
 2. Builds all non-conflicting combinations that satisfy required courses and hard constraints (earliest start, latest end, excluded instructors, etc.).
-3. Scores valid schedules using a fixed priority order: fewer gaps between classes, then fewer class days, earlier finishes, more compact days, and a more balanced week.
+3. Scores valid schedules using a fixed priority order that favors practical schedules for most students: fewer class days, avoiding overly long daily spans, more compact days, earlier finishes, fewer gaps, and a more balanced week.
 4. Renders the best schedules as ASCII calendars with 24-hour times.
 
 ## Inputs
@@ -38,11 +38,14 @@ These are hard constraints. Schedules that violate them are excluded before rank
 
 The script uses a fixed ranking order:
 
-1. `fewer_gaps`
-2. `fewer_days`
-3. `earlier_finish`
-4. `compact_days`
-5. `balanced_week`
+1. `fewer_days`
+2. `avoid_long_spans`
+3. `compact_days`
+4. `earlier_finish`
+5. `fewer_gaps`
+6. `balanced_week`
+
+`avoid_long_spans` adds a soft penalty when a day's first class to last class span exceeds 4 hours. This makes a small gap acceptable if it avoids impractical 4-6 hour marathon days.
 
 The script compares schedules lexicographically using this order.
 
