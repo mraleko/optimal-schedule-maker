@@ -10,7 +10,7 @@ Generate the top course schedules from UT Austin HTML exports using a constraint
 ## Inputs
 
 - Place registrar HTML results under `course_schedule/`.
-- First run creates/updates `parsed_courses/` (json snapshots).
+- First run creates/updates `parsed_courses/` (json snapshots) and `results/` (schedule text files).
 - Provide configuration via `config.json` (no defaults are generated).
 
 ## Running

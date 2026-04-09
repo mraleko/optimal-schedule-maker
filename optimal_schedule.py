@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
+from datetime import datetime
 from dataclasses import dataclass, field
 from itertools import zip_longest
 from pathlib import Path
@@ -29,6 +30,7 @@ except ImportError as exc:  # pragma: no cover - handled at runtime
 BASE_DIR = Path(__file__).resolve().parent
 COURSE_DIR = BASE_DIR / "course_schedule"
 PARSED_DIR = BASE_DIR / "parsed_courses"
+RESULTS_DIR = BASE_DIR / "results"
 CONFIG_PATH = BASE_DIR / "config.json"
 
 DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri"]
@@ -890,10 +892,31 @@ def render_schedule(schedule: Schedule, index: int) -> None:
         )
 
     print("\nWeekly Calendar:")
-    render_calendar(schedule)
+    for line in calendar_lines(schedule, show_details=True):
+        print(line)
 
 
-def render_calendar(schedule: Schedule) -> None:
+def render_results_schedule(schedule: Schedule, index: int) -> str:
+    section_numbers = "\n".join(
+        f"{selection.section.unique_number} - {selection.course_code}"
+        for selection in schedule.selections
+    )
+    return f"Schedule {index + 1}:\n{section_numbers}"
+
+
+def write_results_file(schedules: List[Schedule]) -> Path:
+    ensure_directory(RESULTS_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = RESULTS_DIR / f"{timestamp}.txt"
+    content = "\n\n".join(
+        render_results_schedule(schedule, index)
+        for index, schedule in enumerate(schedules)
+    ) + "\n"
+    output_path.write_text(content, encoding="utf-8")
+    return output_path
+
+
+def calendar_lines(schedule: Schedule, show_details: bool) -> List[str]:
     events_by_day: Dict[str, List[Tuple[int, int, SectionSelection]]] = {
         day: [] for day in DAY_ORDER
     }
@@ -910,16 +933,16 @@ def render_calendar(schedule: Schedule) -> None:
                 latest = meeting.end if latest is None else max(latest, meeting.end)
 
     if earliest is None or latest is None:
-        print("  No scheduled meetings.")
-        return
+        return ["  No scheduled meetings."]
 
     earliest = (earliest // TIME_SLOT_MINUTES) * TIME_SLOT_MINUTES
     latest = ((latest + TIME_SLOT_MINUTES - 1) // TIME_SLOT_MINUTES) * TIME_SLOT_MINUTES
 
     column_width = 26
-    header = "".ljust(8) + "".join(day.center(column_width) for day in DAY_ORDER)
-    print(header)
-    print("".ljust(8) + "".join("=" * column_width for _ in DAY_ORDER))
+    lines = [
+        "".ljust(8) + "".join(day.center(column_width) for day in DAY_ORDER),
+        "".ljust(8) + "".join("=" * column_width for _ in DAY_ORDER),
+    ]
 
     slot_map: Dict[str, Dict[int, Dict[str, object]]] = {day: {} for day in DAY_ORDER}
     for day, entries in events_by_day.items():
@@ -969,9 +992,12 @@ def render_calendar(schedule: Schedule) -> None:
             span: int = event["span"]  # type: ignore[index]
 
             if offset == 0:
-                instructor = selection.section.instructor or "Instructor TBA"
-                last_name = instructor.split(",", 1)[0]
-                title = f"{selection.course_code} - {last_name}"
+                if show_details:
+                    instructor = selection.section.instructor or "Instructor TBA"
+                    last_name = instructor.split(",", 1)[0]
+                    title = f"{selection.course_code} - {last_name}"
+                else:
+                    title = selection.course_code
                 cells.append("|" + title.center(inner_width)[:inner_width].ljust(inner_width) + "|")
             elif offset == span - 1:
                 unique = selection.section.unique_number
@@ -993,11 +1019,12 @@ def render_calendar(schedule: Schedule) -> None:
     boundary = earliest
     while boundary < latest:
         time_label = minutes_to_time_str(boundary).ljust(8)
-        print(time_label + render_boundary(boundary))
-        print("".ljust(8) + render_slot(boundary))
-        print("".ljust(8) + render_fill(boundary))
+        lines.append(time_label + render_boundary(boundary))
+        lines.append("".ljust(8) + render_slot(boundary))
+        lines.append("".ljust(8) + render_fill(boundary))
         boundary += TIME_SLOT_MINUTES
-    print(minutes_to_time_str(latest).ljust(8) + render_boundary(latest))
+    lines.append(minutes_to_time_str(latest).ljust(8) + render_boundary(latest))
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1049,8 @@ def main() -> None:
     schedules = generate_schedules(groups, config)
     if not schedules:
         raise SystemExit("No valid schedules found with current configuration.")
+
+    write_results_file(schedules)
 
     evaluated = getattr(generate_schedules, "last_evaluated", "unknown")
     print(
