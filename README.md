@@ -3,8 +3,8 @@
 Generate the top course schedules from UT Austin HTML exports using a constraint-driven search. The algorithm:
 
 1. Parses registrar HTML results and groups sections by field/level selection rules in `config.json`.
-2. Builds all non-conflicting combinations that satisfy required courses and constraints (earliest start, latest end, excluded instructors, etc.).
-3. Scores schedules based on the total idle minutes between classes. Ties are broken by daily span (latest end − earliest start), then by daily hours standard deviation, then by average end time.
+2. Builds all non-conflicting combinations that satisfy required courses and hard constraints (earliest start, latest end, excluded instructors, etc.).
+3. Scores valid schedules using a fixed priority order: fewer gaps between classes, then fewer class days, earlier finishes, more compact days, and a more balanced week.
 4. Renders the best schedules as ASCII calendars with 24-hour times.
 
 ## Inputs
@@ -19,7 +19,7 @@ Generate the top course schedules from UT Austin HTML exports using a constraint
 python3 optimal_schedule.py
 ```
 
-Output shows the top schedules based on the constraints.
+Output shows the top schedules that satisfy the hard constraints and rank best under the fixed ranking order.
 
 ## `config.json`
 
@@ -30,7 +30,21 @@ Output shows the top schedules based on the constraints.
 - `include_closed`: include closed/cancelled sections.
 - `show_reserved`: include reserved sections.
 - `earliest_start_time`: earliest allowed start (e.g. `09:00`).
-- `latest_end_time` : latest end time allowed (e.g. `17:00`)
+- `latest_end_time`: latest end time allowed (e.g. `17:00`).
+
+These are hard constraints. Schedules that violate them are excluded before ranking.
+
+### Ranking
+
+The script uses a fixed ranking order:
+
+1. `fewer_gaps`
+2. `fewer_days`
+3. `earlier_finish`
+4. `compact_days`
+5. `balanced_week`
+
+The script compares schedules lexicographically using this order.
 
 ### Selections (`selections.course`)
 
@@ -54,3 +68,4 @@ List instructor surnames or full names to avoid (case-insensitive match). Any se
 
 - Requires `beautifulsoup4` (`pip install beautifulsoup4`).
 - ASCII calendar shows schedule from earliest start to latest end.
+- Schedule output includes the ranking priorities and the metrics used to compare results.

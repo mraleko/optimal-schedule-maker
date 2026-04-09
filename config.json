@@ -2,17 +2,17 @@
   "constraints": {
     "top_k": 5,
     "allow_friday": true,
-    "include_closed": true,
+    "include_closed": false,
     "show_reserved": true,
     "earliest_start_time": "09:00",
     "latest_end_time": "17:00"
   },
   "selections": {
     "course": [
-      ["C C 302", "C C 303"],
-      ["C S 429"],
-      ["M - Upper"],
-      ["38265"]
+      ["C S 331"],
+      ["C S - Upper"],
+      ["M 328K"],
+      ["M 427J"]
     ],
     "taken_courses": [
       "C S 314",

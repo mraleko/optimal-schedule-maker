@@ -3,23 +3,20 @@
 
 Steps:
 1. Parse HTML registrar output into course sections grouped by inferred field/level.
-2. Build all non-conflicting section combinations that satisfy config selections and constraints (time windows, excluded instructors, etc.).
-3. Score schedules by minimizing total idle minutes between classes and tie-break using daily span, daily hours standard deviation, and average end time.
-4. Render the top schedules as ASCII calendars with 24-hour times.
+2. Build all non-conflicting section combinations that satisfy config selections and hard constraints.
+3. Score schedules using a fixed ranking order.
+4. Render the best schedules as ASCII calendars with 24-hour times.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import sys
-import textwrap
+import statistics
 from dataclasses import dataclass, field
-from datetime import timedelta
 from itertools import zip_longest
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Set
-import statistics
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     from bs4 import BeautifulSoup  # type: ignore
@@ -36,6 +33,13 @@ CONFIG_PATH = BASE_DIR / "config.json"
 
 DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 TIME_SLOT_MINUTES = 30
+DEFAULT_PRIORITY_ORDER = (
+    "fewer_gaps",
+    "fewer_days",
+    "earlier_finish",
+    "compact_days",
+    "balanced_week",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -76,10 +80,37 @@ class SectionSelection:
     section: Section
 
 
+@dataclass(frozen=True)
+class HardConstraints:
+    top_k: int
+    allow_friday: bool
+    include_closed: bool
+    show_reserved: bool
+    earliest_start: int
+    latest_end: int
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    constraints: HardConstraints
+    selections: Dict[str, object]
+
+
+@dataclass(frozen=True)
+class ScheduleMetrics:
+    total_gap: float
+    days_with_classes: float
+    earliest_start: float
+    latest_end: float
+    max_daily_span: float
+    daily_hours_std: float
+    average_end: float
+
+
 @dataclass
 class Schedule:
     selections: List[SectionSelection]
-    metrics: Dict[str, float]
+    metrics: ScheduleMetrics
 
 
 # ---------------------------------------------------------------------------
@@ -185,17 +216,16 @@ def parse_time_range(text: str) -> Optional[Tuple[int, int]]:
         return None
 
     if end <= start:
-        # Assume wrapped times cross noon/midnight; add 12 hours until end > start.
         while end <= start:
             end += 12 * 60
 
     return start, end
 
 
-def minutes_to_time_str(minutes: int) -> str:
-    minutes = int(minutes)
-    hour = (minutes // 60) % 24
-    minute = minutes % 60
+def minutes_to_time_str(minutes: float) -> str:
+    total_minutes = int(minutes)
+    hour = (total_minutes // 60) % 24
+    minute = total_minutes % 60
     return f"{hour:02d}:{minute:02d}"
 
 
@@ -203,15 +233,37 @@ def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def level_code_to_name(code: str) -> str:
-    mapping = {"U": "Upper", "L": "Lower", "G": "Grad"}
-    return mapping.get(code.upper(), code)
-
-
 def sanitise_filename(field: str, level: str) -> str:
     safe = f"{field}_{level}".replace(" ", "_")
     safe = safe.replace("/", "-").replace("\\", "-")
     return safe
+
+
+def parse_time_to_minutes(value: str, default: int) -> int:
+    value = value.strip()
+    if not value:
+        return default
+
+    import re
+
+    match = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", value, flags=re.IGNORECASE)
+    if not match:
+        return default
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = match.group(3)
+    if meridiem:
+        meridiem = meridiem.lower()
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+    return hour * 60 + minute
+
+
+def parse_bool(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +325,11 @@ def extract_courses_from_soup(soup: BeautifulSoup) -> Iterable[Course]:
             course_number = tokens[course_number_index]
             title_tokens = tokens[course_number_index + 1 :]
 
-            inferred_field = " ".join(field_tokens).strip()
-            course_field = inferred_field
-
             try:
-                numeric_part = int(''.join(filter(str.isdigit, course_number))[-2:])
+                numeric_part = int("".join(filter(str.isdigit, course_number))[-2:])
             except (ValueError, IndexError):
                 numeric_part = 0
+
             if 1 <= numeric_part <= 19:
                 course_level = "Lower"
             elif 20 <= numeric_part <= 79:
@@ -289,14 +339,11 @@ def extract_courses_from_soup(soup: BeautifulSoup) -> Iterable[Course]:
             else:
                 course_level = "UNKNOWN"
 
-            course_code = f"{' '.join(field_tokens)} {course_number}".strip()
-            course_title = " ".join(title_tokens).strip()
-
             current_course = Course(
-                field=course_field,
+                field=" ".join(field_tokens).strip(),
                 level=course_level,
-                course_code=course_code,
-                course_title=course_title,
+                course_code=f"{' '.join(field_tokens)} {course_number}".strip(),
+                course_title=" ".join(title_tokens).strip(),
             )
             continue
 
@@ -430,314 +477,264 @@ def write_grouped_json(courses: List[Course]) -> None:
 # Configuration
 
 
-def load_config(path: Path) -> Dict[str, object]:
+def load_config(path: Path) -> AppConfig:
     if not path.exists():
         raise SystemExit(f"Config file not found: {path}. Please create config.json based on README guidance.")
 
     with path.open("r", encoding="utf-8") as handle:
-        config = json.load(handle)
+        raw_config = json.load(handle)
 
-    if not isinstance(config, dict):
+    if not isinstance(raw_config, dict):
         raise SystemExit("Config root must be a JSON object.")
 
-    filters = config.get("constraints")
-    if not isinstance(filters, dict):
+    raw_constraints = raw_config.get("constraints")
+    if not isinstance(raw_constraints, dict):
         raise SystemExit("Config missing 'constraints' object.")
 
-    selections = config.get("selections")
-    if not isinstance(selections, dict):
+    raw_selections = raw_config.get("selections")
+    if not isinstance(raw_selections, dict):
         raise SystemExit("Config missing 'selections' object.")
 
-    if "top_k" not in filters:
-        raise SystemExit("Config constraints.top_k is required.")
-
-    if "earliest_start_time" not in filters or "latest_end_time" not in filters:
-        raise SystemExit("Config constraints.earliest_start_time and constraints.latest_end_time are required.")
-
-    if "course" not in selections:
-        raise SystemExit("Config selections.course is required.")
-
-    top_k = filters.get("top_k")
+    top_k = raw_constraints.get("top_k")
     if not isinstance(top_k, int) or top_k <= 0:
         raise SystemExit("Config constraints.top_k must be a positive integer.")
 
-    selections_config = dict(selections)
-    course_entries = selections_config.get("course")
+    earliest_start_time = raw_constraints.get("earliest_start_time")
+    latest_end_time = raw_constraints.get("latest_end_time")
+    if not isinstance(earliest_start_time, str) or not earliest_start_time.strip():
+        raise SystemExit("Config constraints.earliest_start_time must be a non-empty string.")
+    if not isinstance(latest_end_time, str) or not latest_end_time.strip():
+        raise SystemExit("Config constraints.latest_end_time must be a non-empty string.")
+
+    course_entries = raw_selections.get("course")
     if isinstance(course_entries, str):
-        selections_config["course"] = [course_entries]
-    elif not isinstance(course_entries, list):
+        selections = dict(raw_selections)
+        selections["course"] = [course_entries]
+    elif isinstance(course_entries, list):
+        selections = dict(raw_selections)
+    else:
         raise SystemExit("Config selections.course must be a list or string.")
 
-    for time_key in ("earliest_start_time", "latest_end_time"):
-        value = filters.get(time_key)
-        if not isinstance(value, str) or not value.strip():
-            raise SystemExit(f"Config constraints.{time_key} must be a non-empty string.")
-
-    config["constraints"] = filters
-    config["selections"] = selections_config
-    config["constraints"]["top_k"] = top_k
-    return config
-
-
-def parse_time_to_minutes(value: str, default: int) -> int:
-    value = value.strip()
-    if not value:
-        return default
-    import re
-
-    match = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", value, flags=re.IGNORECASE)
-    if not match:
-        return default
-
-    hour = int(match.group(1))
-    minute = int(match.group(2) or 0)
-    meridiem = match.group(3)
-    if meridiem:
-        meridiem = meridiem.lower()
-        if meridiem == "pm" and hour != 12:
-            hour += 12
-        if meridiem == "am" and hour == 12:
-            hour = 0
-    return hour * 60 + minute
-
-
-def parse_earliest_start(config_filters: Dict[str, object]) -> int:
-    return parse_time_to_minutes(str(config_filters.get("earliest_start_time", "8:00 AM")), 8 * 60)
-
-
-def parse_latest_end(config_filters: Dict[str, object]) -> int:
-    return parse_time_to_minutes(str(config_filters.get("latest_end_time", "11:00 PM")), 23 * 60)
+    constraints = HardConstraints(
+        top_k=top_k,
+        allow_friday=parse_bool(raw_constraints.get("allow_friday"), True),
+        include_closed=parse_bool(raw_constraints.get("include_closed"), False),
+        show_reserved=parse_bool(raw_constraints.get("show_reserved"), True),
+        earliest_start=parse_time_to_minutes(earliest_start_time, 8 * 60),
+        latest_end=parse_time_to_minutes(latest_end_time, 23 * 60),
+    )
+    return AppConfig(constraints=constraints, selections=selections)
 
 
 # ---------------------------------------------------------------------------
 # Selection and filtering
 
 
-def section_passes_filters(section: Section, filters: Dict[str, object], earliest_start: int) -> bool:
+def section_passes_filters(section: Section, constraints: HardConstraints) -> bool:
     status_lower = section.status.lower()
 
-    if not filters.get("include_closed", False) and ("closed" in status_lower or "cancelled" in status_lower):
+    if not constraints.include_closed and ("closed" in status_lower or "cancelled" in status_lower):
         return False
-    if not filters.get("show_reserved", True) and "reserved" in status_lower:
+    if not constraints.show_reserved and "reserved" in status_lower:
         return False
 
-    allow_friday = bool(filters.get("allow_friday", True))
     for meeting in section.meetings:
-        if not allow_friday and any(day == "Fri" for day in meeting.days):
+        if not constraints.allow_friday and any(day == "Fri" for day in meeting.days):
             return False
-        if earliest_start and meeting.start < earliest_start:
+        if meeting.start < constraints.earliest_start:
+            return False
+        if meeting.end > constraints.latest_end:
             return False
 
     return True
+
+
+def build_course_options(
+    course: Course,
+    constraints: HardConstraints,
+    excluded_instructors: Set[str],
+) -> List[SectionSelection]:
+    options: List[SectionSelection] = []
+    for section in course.sections:
+        instructor_name = normalise_whitespace(section.instructor).lower()
+        instructor_last = instructor_name.split(",", 1)[0]
+        if excluded_instructors and (
+            instructor_name in excluded_instructors or instructor_last in excluded_instructors
+        ):
+            continue
+        if not section_passes_filters(section, constraints):
+            continue
+        options.append(
+            SectionSelection(
+                course_code=course.course_code,
+                course_title=course.course_title,
+                section=section,
+            )
+        )
+    return options
+
+
+def selector_is_unique_number(selector: str) -> bool:
+    digits_only = normalise_whitespace(selector).replace(" ", "")
+    return digits_only.isdigit()
+
+
+def resolve_selector(
+    selector: str,
+    courses: List[Course],
+    by_code: Dict[str, Course],
+    by_unique: Dict[str, Tuple[Course, Section]],
+    constraints: HardConstraints,
+    taken_courses: Set[str],
+    excluded_instructors: Set[str],
+) -> List[SectionSelection]:
+    value = normalise_whitespace(selector)
+    digits_only = value.replace(" ", "")
+
+    if digits_only.isdigit():
+        record = by_unique.get(digits_only)
+        if not record:
+            return []
+        course, section = record
+        if course.course_code in taken_courses or not section_passes_filters(section, constraints):
+            return []
+        instructor_name = normalise_whitespace(section.instructor).lower()
+        instructor_last = instructor_name.split(",", 1)[0]
+        if excluded_instructors and (
+            instructor_name in excluded_instructors or instructor_last in excluded_instructors
+        ):
+            return []
+        return [
+            SectionSelection(
+                course_code=course.course_code,
+                course_title=course.course_title,
+                section=section,
+            )
+        ]
+
+    direct_course = by_code.get(value)
+    if direct_course and direct_course.course_code not in taken_courses:
+        return build_course_options(direct_course, constraints, excluded_instructors)
+
+    if "-" in value:
+        field_part, level_part = [part.strip() for part in value.split("-", 1)]
+        if field_part and level_part:
+            options: List[SectionSelection] = []
+            for course in courses:
+                if course.field != field_part or course.level.lower() != level_part.lower():
+                    continue
+                if course.course_code in taken_courses:
+                    continue
+                options.extend(build_course_options(course, constraints, excluded_instructors))
+            return options
+
+    options = []
+    for course in courses:
+        if course.field != value:
+            continue
+        if course.course_code in taken_courses:
+            continue
+        options.extend(build_course_options(course, constraints, excluded_instructors))
+    return options
+
+
+def deduplicate_selections(selections: List[SectionSelection]) -> List[SectionSelection]:
+    unique: Dict[Tuple[str, str], SectionSelection] = {}
+    for selection in selections:
+        key = (selection.course_code, selection.section.unique_number)
+        unique[key] = selection
+    return sorted(unique.values(), key=lambda item: (item.course_code, item.section.unique_number))
 
 
 def build_course_groups(
     courses: List[Course],
     by_code: Dict[str, Course],
     by_unique: Dict[str, Tuple[Course, Section]],
-    config: Dict[str, object],
-) -> List[SectionSelection]:
-    filters = config.get("constraints", {})
-    earliest_start = parse_earliest_start(filters)
-    latest_end_allowed = parse_latest_end(filters)
+    config: AppConfig,
+) -> List[List[SectionSelection]]:
+    selection_entries = config.selections.get("course", []) or []
+    if isinstance(selection_entries, str):
+        selection_entries = [selection_entries]
+    if not isinstance(selection_entries, list):
+        return []
 
-    selections_config = config.get("selections", {}) or {}
-    selection_entries = selections_config.get("course", []) or []
-    if isinstance(selection_entries, (str, list)):
-        pass
-    else:
-        selection_entries = []
-
-    taken_entries = selections_config.get("taken_courses", []) or []
+    taken_entries = config.selections.get("taken_courses", []) or []
     if isinstance(taken_entries, str):
         taken_entries = [taken_entries]
-    taken_courses = {normalise_whitespace(code) for code in taken_entries if isinstance(code, str)}
+    taken_courses = {
+        normalise_whitespace(code)
+        for code in taken_entries
+        if isinstance(code, str) and code.strip()
+    }
 
-    excluded_instructors_raw = selections_config.get("excluded_instructors", []) or []
-    if isinstance(excluded_instructors_raw, str):
-        excluded_instructors_raw = [excluded_instructors_raw]
+    excluded_entries = config.selections.get("excluded_instructors", []) or []
+    if isinstance(excluded_entries, str):
+        excluded_entries = [excluded_entries]
     excluded_instructors = {
         normalise_whitespace(name).lower()
-        for name in excluded_instructors_raw
+        for name in excluded_entries
         if isinstance(name, str) and name.strip()
     }
 
-    groups: Dict[str, List[SectionSelection]] = {}
-    locked_courses: Dict[str, str] = {}
-    assigned_field_levels: Dict[Tuple[str, str], Set[str]] = {}
-    assigned_fields: Dict[str, Set[str]] = {}
-
-    def remove_course_from_groups(course_code: str) -> None:
-        for key in list(groups.keys()):
-            filtered = [opt for opt in groups[key] if opt.course_code != course_code]
-            if not filtered:
-                groups.pop(key, None)
-            else:
-                groups[key] = filtered
-
-    def register_group(key: str, selections: List[SectionSelection], course_code: Optional[str] = None, override: bool = False) -> None:
-        if not selections:
-            return
-        if override or key not in groups:
-            groups[key] = selections
-        else:
-            groups[key].extend(selections)
-        if course_code:
-            locked_courses[course_code] = key
-
-    def unique_group_key(base: str) -> str:
-        if base not in groups:
-            return base
-        counter = 2
-        while f"{base}#{counter}" in groups:
-            counter += 1
-        return f"{base}#{counter}"
-
-    def add_course_to_groups(course: Course) -> bool:
-        if course.course_code in groups or course.course_code in locked_courses:
-            return False
-        options: List[SectionSelection] = []
-        for section in course.sections:
-            instructor_name = normalise_whitespace(section.instructor).lower()
-            instructor_last = instructor_name.split(",", 1)[0]
-            if excluded_instructors and (
-                instructor_name in excluded_instructors or instructor_last in excluded_instructors
-            ):
-                continue
-            if not section_passes_filters(section, filters, earliest_start):
-                continue
-            if any(meeting.end > latest_end_allowed for meeting in section.meetings):
-                continue
-            options.append(
-                SectionSelection(
-                    course_code=course.course_code,
-                    course_title=course.course_title,
-                    section=section,
-                )
-            )
-        if options:
-            register_group(course.course_code, options, course.course_code)
-            return True
-        return False
-
-    def course_is_taken(course_code: str) -> bool:
-        return course_code in taken_courses
-
+    groups: List[List[SectionSelection]] = []
     for entry in selection_entries:
-        if isinstance(entry, list):
-            options_raw = entry
-        else:
-            options_raw = [entry]
-
-        options = [opt for opt in options_raw if isinstance(opt, str) and opt.strip()]
-        if not options:
+        selectors = entry if isinstance(entry, list) else [entry]
+        valid_selectors = [selector for selector in selectors if isinstance(selector, str) and selector.strip()]
+        if not valid_selectors:
             continue
 
-        fulfilled = False
-        for value in options:
-            value = value.strip()
-            normalised = normalise_whitespace(value)
-            digits_only = normalised.replace(" ", "")
+        exact_matches: List[SectionSelection] = []
+        flexible_matches: List[SectionSelection] = []
+        for selector in valid_selectors:
+            matches = resolve_selector(
+                selector,
+                courses,
+                by_code,
+                by_unique,
+                config.constraints,
+                taken_courses,
+                excluded_instructors,
+            )
+            if selector_is_unique_number(selector):
+                exact_matches.extend(matches)
+            else:
+                flexible_matches.extend(matches)
 
-        # Unique number selector
-        if digits_only.isdigit():
-            record = by_unique.get(digits_only)
-            if record:
-                course, section = record
-                if section_passes_filters(section, filters, earliest_start):
-                    if course_is_taken(course.course_code):
-                        continue
-                    remove_course_from_groups(course.course_code)
-                    selection = SectionSelection(
-                        course_code=course.course_code,
-                        course_title=course.course_title,
-                        section=section,
-                    )
-                    register_group(course.course_code, [selection], course.course_code, override=True)
-                    fulfilled = True
-                    break
-        if fulfilled:
-            continue
+        group = deduplicate_selections(exact_matches or flexible_matches)
+        if group:
+            groups.append(group)
 
-        # Direct course code selector
-        for value in options:
-            normalised = normalise_whitespace(value)
-            course = by_code.get(normalised)
-            if course and not course_is_taken(course.course_code):
-                remove_course_from_groups(course.course_code)
-                if add_course_to_groups(course):
-                    fulfilled = True
-                    break
-        if fulfilled:
-            continue
-
-        # Field-level selector (e.g., "C S - Upper")
-        for value in options:
-            if "-" not in value:
-                continue
-            field_part, level_part = [part.strip() for part in value.split("-", 1)]
-            level_part_lower = level_part.lower()
-            assigned = assigned_field_levels.setdefault((field_part, level_part_lower), set())
-            for course_candidate in courses:
-                if course_candidate.field != field_part:
-                    continue
-                if level_part and course_candidate.level.lower() != level_part_lower:
-                    continue
-                if course_is_taken(course_candidate.course_code):
-                    continue
-                if course_candidate.course_code in assigned:
-                    continue
-                if add_course_to_groups(course_candidate):
-                    assigned.add(course_candidate.course_code)
-                    fulfilled = True
-                    break
-            if fulfilled:
-                break
-        if fulfilled:
-            continue
-
-        # Field-only selector (e.g., "C S")
-        for value in options:
-            normalised = normalise_whitespace(value)
-            assigned_field = assigned_fields.setdefault(normalised, set())
-            for course_candidate in courses:
-                if course_candidate.field != normalised:
-                    continue
-                if course_is_taken(course_candidate.course_code):
-                    continue
-                if course_candidate.course_code in assigned_field:
-                    continue
-                if add_course_to_groups(course_candidate):
-                    assigned_field.add(course_candidate.course_code)
-                    fulfilled = True
-                    break
-            if fulfilled:
-                break
-
-    return list(groups.values())
+    return groups
 
 
 # ---------------------------------------------------------------------------
 # Schedule generation and scoring
 
 
-def schedule_conflicts(selection: SectionSelection, day_map: Dict[str, List[Tuple[int, int, SectionSelection]]], latest_end_allowed: int) -> bool:
+def schedule_conflicts(
+    selection: SectionSelection,
+    day_map: Dict[str, List[Tuple[int, int, SectionSelection]]],
+    chosen_courses: Set[str],
+    constraints: HardConstraints,
+) -> bool:
+    if selection.course_code in chosen_courses:
+        return True
+
     for meeting in selection.section.meetings:
+        if meeting.end > constraints.latest_end:
+            return True
         for day in meeting.days:
             entries = day_map.setdefault(day, [])
-            for start, end, existing in entries:
+            for start, end, _ in entries:
                 if meeting.start < end and meeting.end > start:
                     return True
-        if meeting.end > latest_end_allowed:
-            return True
     return False
 
 
 def add_selection_to_day_map(selection: SectionSelection, day_map: Dict[str, List[Tuple[int, int, SectionSelection]]]) -> None:
     for meeting in selection.section.meetings:
         for day in meeting.days:
-            entries = day_map.setdefault(day, [])
-            entries.append((meeting.start, meeting.end, selection))
+            day_map.setdefault(day, []).append((meeting.start, meeting.end, selection))
 
 
 def remove_selection_from_day_map(selection: SectionSelection, day_map: Dict[str, List[Tuple[int, int, SectionSelection]]]) -> None:
@@ -752,16 +749,18 @@ def remove_selection_from_day_map(selection: SectionSelection, day_map: Dict[str
                 continue
 
 
-def evaluate_schedule(selections: List[SectionSelection]) -> Dict[str, float]:
-    daily_latest: List[int] = []
+def evaluate_schedule(selections: List[SectionSelection]) -> ScheduleMetrics:
     total_gap = 0
-    earliest_start = None
-    latest_end = None
+    days_with_classes = 0
+    earliest_start: Optional[int] = None
+    latest_end: Optional[int] = None
+    max_daily_span = 0
+    daily_latest: List[int] = []
     daily_hours: List[float] = []
 
     for day in DAY_ORDER:
         intervals = [
-            (meeting.start, meeting.end, selection)
+            (meeting.start, meeting.end)
             for selection in selections
             for meeting in selection.section.meetings
             if day in meeting.days
@@ -769,98 +768,116 @@ def evaluate_schedule(selections: List[SectionSelection]) -> Dict[str, float]:
         if not intervals:
             daily_hours.append(0.0)
             continue
+
+        days_with_classes += 1
         intervals.sort(key=lambda item: item[0])
-        last_end = intervals[-1][1]
-        daily_latest.append(last_end)
+        day_start = intervals[0][0]
+        day_end = intervals[-1][1]
+        daily_latest.append(day_end)
+        max_daily_span = max(max_daily_span, day_end - day_start)
+        earliest_start = day_start if earliest_start is None else min(earliest_start, day_start)
+        latest_end = day_end if latest_end is None else max(latest_end, day_end)
 
-        for start, end, _ in intervals:
-            earliest_start = start if earliest_start is None else min(earliest_start, start)
-            latest_end = end if latest_end is None else max(latest_end, end)
+        total_minutes = sum(end - start for start, end in intervals)
+        daily_hours.append(total_minutes / 60.0)
 
-        day_total = 0
-        for start, end, _ in intervals:
-            day_total += end - start
-        daily_hours.append(day_total / 60.0)
-
-        for idx in range(1, len(intervals)):
-            prev_end = intervals[idx - 1][1]
-            current_start = intervals[idx][0]
-            if current_start > prev_end:
-                total_gap += current_start - prev_end
+        for index in range(1, len(intervals)):
+            previous_end = intervals[index - 1][1]
+            current_start = intervals[index][0]
+            if current_start > previous_end:
+                total_gap += current_start - previous_end
 
     average_end = sum(daily_latest) / len(daily_latest) if daily_latest else 0.0
-    span = (latest_end - earliest_start) if (earliest_start is not None and latest_end is not None) else 0.0
-    std_dev = statistics.pstdev(daily_hours) if daily_hours else 0.0
+    daily_hours_std = statistics.pstdev(daily_hours) if daily_hours else 0.0
 
-    return {
-        "average_end": average_end,
-        "latest_end": latest_end or 0.0,
-        "total_gap": float(total_gap),
-        "daily_span": float(span),
-        "earliest_start": float(earliest_start or 0.0),
-        "daily_std": float(std_dev),
-    }
+    return ScheduleMetrics(
+        total_gap=float(total_gap),
+        days_with_classes=float(days_with_classes),
+        earliest_start=float(earliest_start or 0.0),
+        latest_end=float(latest_end or 0.0),
+        max_daily_span=float(max_daily_span),
+        daily_hours_std=float(daily_hours_std),
+        average_end=float(average_end),
+    )
 
 
-def generate_schedules(groups: List[List[SectionSelection]], top_k: int, filters: Dict[str, object]) -> List[Schedule]:
-    sorted_groups = sorted(groups, key=len)
-    total_groups = len(sorted_groups)
-    if total_groups == 0:
+def schedule_sort_key(metrics: ScheduleMetrics) -> Tuple[float, ...]:
+    return (
+        metrics.total_gap,
+        metrics.days_with_classes,
+        metrics.latest_end,
+        metrics.max_daily_span,
+        metrics.daily_hours_std,
+        metrics.average_end,
+    )
+
+
+def generate_schedules(groups: List[List[SectionSelection]], config: AppConfig) -> List[Schedule]:
+    sorted_groups = sorted(
+        (sorted(group, key=lambda item: (item.course_code, item.section.unique_number)) for group in groups),
+        key=len,
+    )
+    if not sorted_groups:
         return []
 
     schedules: List[Schedule] = []
     evaluated_count = 0
-    latest_end_allowed = parse_latest_end(filters)
 
-    def backtrack(index: int, current: List[SectionSelection], day_map: Dict[str, List[Tuple[int, int, SectionSelection]]]):
+    def backtrack(
+        index: int,
+        current: List[SectionSelection],
+        day_map: Dict[str, List[Tuple[int, int, SectionSelection]]],
+        chosen_courses: Set[str],
+    ) -> None:
         nonlocal evaluated_count
-        if index == total_groups:
-            metrics = evaluate_schedule(current)
-            schedules.append(Schedule(list(current), metrics))
+        if index == len(sorted_groups):
+            schedules.append(Schedule(list(current), evaluate_schedule(current)))
             evaluated_count += 1
             return
 
         for selection in sorted_groups[index]:
-            if selection.section.meetings and schedule_conflicts(selection, day_map, latest_end_allowed):
+            if schedule_conflicts(selection, day_map, chosen_courses, config.constraints):
                 continue
+            chosen_courses.add(selection.course_code)
             add_selection_to_day_map(selection, day_map)
             current.append(selection)
-            backtrack(index + 1, current, day_map)
+            backtrack(index + 1, current, day_map, chosen_courses)
             current.pop()
             remove_selection_from_day_map(selection, day_map)
+            chosen_courses.remove(selection.course_code)
 
-    backtrack(0, [], {})
+    backtrack(0, [], {}, set())
 
-    if not schedules:
-        return []
-
-    schedules.sort(
-        key=lambda sch: (
-            sch.metrics["total_gap"],
-            sch.metrics["daily_span"],
-            sch.metrics["daily_std"],
-            sch.metrics["average_end"],
-        )
-    )
-
+    schedules.sort(key=lambda schedule: schedule_sort_key(schedule.metrics))
     generate_schedules.last_evaluated = evaluated_count
-    return schedules[:top_k]
+    return schedules[: config.constraints.top_k]
 
 
 # ---------------------------------------------------------------------------
 # Presentation helpers
 
 
-def render_schedule(schedule: Schedule, index: int, strategy: str) -> None:
+def format_duration(minutes: float) -> str:
+    whole_minutes = int(minutes)
+    return f"{whole_minutes // 60:02d}:{whole_minutes % 60:02d}"
+
+
+def describe_priorities() -> str:
+    return " > ".join(DEFAULT_PRIORITY_ORDER)
+
+
+def render_schedule(schedule: Schedule, index: int) -> None:
+    metrics = schedule.metrics
     print(f"\n=== Schedule {index + 1} ===")
-    avg_end = minutes_to_time_str(schedule.metrics['average_end'])
-    latest_end = minutes_to_time_str(schedule.metrics['latest_end'])
-    span_minutes = schedule.metrics.get('daily_span', 0.0)
-    span_str = f"{int(span_minutes // 60):02d}:{int(span_minutes % 60):02d}"
-    std_val = schedule.metrics.get('daily_std', 0.0)
+    print(f"Ranking priorities: {describe_priorities()}")
     print(
-        f"Schedule metrics: average_end={avg_end}, latest_end={latest_end}, "
-        f"span={span_str}, daily_std={std_val:.2f} h, total_gap={schedule.metrics['total_gap']:.1f} min"
+        "Schedule metrics: "
+        f"total_gap={metrics.total_gap:.1f} min, "
+        f"days_with_classes={int(metrics.days_with_classes)}, "
+        f"latest_end={minutes_to_time_str(metrics.latest_end)}, "
+        f"max_daily_span={format_duration(metrics.max_daily_span)}, "
+        f"daily_hours_std={metrics.daily_hours_std:.2f} h, "
+        f"earliest_start={minutes_to_time_str(metrics.earliest_start)}"
     )
 
     print("\nSelected Sections:")
@@ -998,25 +1015,21 @@ def main() -> None:
     write_grouped_json(courses)
 
     config = load_config(CONFIG_PATH)
-    constraints = config.get("constraints", {})
-    top_k = int(constraints.get("top_k", 5) or 5)
-
     groups = build_course_groups(courses, by_code, by_unique, config)
-
     if not groups:
         raise SystemExit("No course groups were selected. Update config.json selections.")
 
-    schedules = generate_schedules(groups, top_k, constraints)
+    schedules = generate_schedules(groups, config)
     if not schedules:
         raise SystemExit("No valid schedules found with current configuration.")
 
     evaluated = getattr(generate_schedules, "last_evaluated", "unknown")
     print(
-        f"Generated {len(schedules)} schedule(s) prioritizing minimal idle time between classes. "
+        f"Generated {len(schedules)} schedule(s) using priorities {describe_priorities()}. "
         f"Compared {len(groups)} course group(s) and evaluated {evaluated} combinations."
     )
     for idx, schedule in enumerate(schedules):
-        render_schedule(schedule, idx, "minimal_idle")
+        render_schedule(schedule, idx)
 
 
 if __name__ == "__main__":
@@ -1024,4 +1037,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
-

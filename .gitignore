@@ -1,0 +1,5 @@
+.DS_Store
+parsed_courses/*
+results/*
+course_schedule/*
+!course_schedule/example.html
