@@ -10,8 +10,8 @@
   "selections": {
     "course": [
       ["C S 331"],
-      ["C S - Upper"],
-      ["M 328K"],
+      ["C S 363M"],
+      ["M 325K"],
       ["M 427J"]
     ],
     "taken_courses": [
@@ -32,7 +32,11 @@
       "C C 302",
       "C S 429",
       "HIS 315L",
-      "M 340L"
+      "M 340L",
+      "SDS 320E",
+      "UGS 303",
+      "C S 439",
+      "E 316L"
     ],
     "excluded_instructors": [
       "RUSIN"
